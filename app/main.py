@@ -18,6 +18,9 @@
 * ``POST /inventory/allocate`` 试剂批次 FEFO 领用分配：按失效日期优先、
   同日批号升序跨批次扣减（名义量×纯度换算有效物质），跳过过期/隔离批次，
   返回每批领用/余量、未满足需求与汇总状态；
+* ``POST /solutions/blend`` 溶液配制：至多 4 种母液的浓度与可用体积、
+  目标终体积与目标浓度 -> 精确有理数求非负取用量（母液总量最小、再按
+  输入顺序字典序最小）、补水量与终浓度，无解返回 422；
 * ``GET  /reactions/{reaction_id}``  按幂等 ID 取回结果；
 * ``GET  /health``   健康检查。
 """
@@ -34,6 +37,8 @@ from .models import (
     AllocateResponse,
     AnalyzeResponse,
     BalanceResponse,
+    BlendRequest,
+    BlendResponse,
     ReactionRequest,
     ReversePlanRequest,
     ReversePlanResponse,
@@ -52,6 +57,7 @@ from .service import (
     process_allocate,
     process_analyze,
     process_balance,
+    process_blend,
     process_reverse_plan,
     process_sequence,
     process_stoichiometry,
@@ -64,7 +70,8 @@ app = FastAPI(
     description=(
         "解析含元素、括号与电荷的化学式，建立元素守恒与电荷守恒矩阵，"
         "通过有理数高斯-若尔当消元求解最小互质正整数系数；"
-        "并提供限量试剂计量、连续反应推演与试剂批次 FEFO 领用分配。"
+        "并提供限量试剂计量、连续反应推演、试剂批次 FEFO 领用分配与"
+        "多母液精确配制。"
     ),
     version=__version__,
 )
@@ -90,8 +97,8 @@ async def handle_validation_error(request: Request, exc: RequestValidationError)
             "error": {
                 "code": "INVALID_REQUEST",
                 "message": "请求体校验失败：请检查必填字段、字段类型与取值范围"
-                "（摩尔数/纯度须为十进制字符串、日期须为 YYYY-MM-DD、"
-                "状态只能为 available 或 quarantined）",
+                "（摩尔数/纯度/浓度/体积须为十进制字符串、日期须为 YYYY-MM-DD、"
+                "状态只能为 available 或 quarantined、母液数量为 1～4）",
                 "details": {"validation": _jsonable_errors(exc.errors())},
             }
         },
@@ -244,6 +251,24 @@ async def inventory_allocate(request: AllocateRequest):
             for item in request.batches
         ],
         request.accounting_date,
+    )
+    return JSONResponse(status_code=status, content=payload)
+
+
+@app.post(
+    "/api/v1/solutions/blend",
+    response_model=BlendResponse,
+    tags=["配制"],
+    summary="溶液配制：多母液精确取用量规划（总量最小、字典序择优）",
+    responses={
+        422: {"description": "请求字段非法，或容量/终体积约束内无可行配制"},
+    },
+)
+async def solutions_blend(request: BlendRequest):
+    status, payload = process_blend(
+        [item.model_dump() for item in request.stocks],
+        request.final_volume_ml,
+        [item.model_dump() for item in request.targets],
     )
     return JSONResponse(status_code=status, content=payload)
 

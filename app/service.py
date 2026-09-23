@@ -15,6 +15,7 @@ from .allocation import (
     parse_purity,
     render_allocation,
 )
+from .blend import Stock, Target, solve_blend
 from .balancer import (
     VARIANT_SPACE_TOO_LARGE,
     BalanceError,
@@ -50,6 +51,8 @@ STATUS_CODES = {
     "CHARGE_NOT_CONSERVED": 422,
     VARIANT_SPACE_TOO_LARGE: 422,
     "INVALID_INVENTORY": 422,
+    "INVALID_BLEND": 422,
+    "BLEND_NO_SOLUTION": 422,
 }
 
 
@@ -1097,3 +1100,167 @@ def process_allocate(
 
     result = allocate(demands, batches, accounting_date)
     return 200, render_allocation(result)
+
+
+# ------------------------------------------------------------ 溶液配制
+def process_blend(
+    stock_items: list[dict[str, Any]],
+    final_volume_text: str,
+    target_items: list[dict[str, str]],
+) -> tuple[int, dict[str, Any]]:
+    """溶液配制规划，返回 (http_status, payload)。
+
+    把母液浓度/可用体积、终体积与目标浓度逐条解析为精确有理数，聚合全部
+    可定位的输入问题为 422 INVALID_BLEND（母液标识重复、浓度/体积十进制
+    非法、终体积为 0、目标溶质重复或不出现在任何母液中）；校验通过后调用
+    :func:`app.blend.solve_blend` 在容量与终体积约束内求满足全部目标浓度
+    的非负取用量，按母液总取用量最小、再按输入顺序字典序最小择优，余量
+    用水补足。不存在可行配制时返回 422 BLEND_NO_SOLUTION。
+    """
+    # ---- 母液：解析各浓度与可用体积
+    stocks: list[Stock] = []
+    duplicate_ids: list[str] = []
+    seen_ids: set[str] = set()
+    invalid_decimals: list[dict[str, str]] = []
+
+    for index, item in enumerate(stock_items):
+        stock_id = item["id"]
+        if stock_id in seen_ids:
+            duplicate_ids.append(stock_id)
+        seen_ids.add(stock_id)
+
+        concentrations: dict[str, Fraction] = {}
+        for solute, text in item["concentrations"].items():
+            try:
+                amount = parse_moles(text)
+            except (ValueError, InvalidOperation):
+                invalid_decimals.append(
+                    {"field": "stocks.concentrations", "stock_id": stock_id,
+                     "solute": solute, "value": text}
+                )
+                continue
+            concentrations[solute] = decimal_to_fraction(amount)
+
+        volume_text = item["available_volume_ml"]
+        try:
+            volume = decimal_to_fraction(parse_moles(volume_text))
+        except (ValueError, InvalidOperation):
+            invalid_decimals.append(
+                {"field": "stocks.available_volume_ml", "stock_id": stock_id,
+                 "value": volume_text}
+            )
+            volume = None
+
+        if volume is not None:
+            stocks.append(
+                Stock(id=stock_id, concentrations=concentrations,
+                      available_volume=volume)
+            )
+
+    # ---- 终体积
+    try:
+        final_volume = decimal_to_fraction(parse_moles(final_volume_text))
+    except (ValueError, InvalidOperation):
+        invalid_decimals.append(
+            {"field": "final_volume_ml", "value": final_volume_text}
+        )
+        final_volume = None
+
+    # ---- 目标：解析浓度，检查重复
+    targets: list[Target] = []
+    duplicate_targets: list[str] = []
+    seen_targets: set[str] = set()
+    for item in target_items:
+        solute = item["solute"]
+        text = item["concentration"]
+        if solute in seen_targets:
+            duplicate_targets.append(solute)
+        seen_targets.add(solute)
+        try:
+            concentration = decimal_to_fraction(parse_moles(text))
+        except (ValueError, InvalidOperation):
+            invalid_decimals.append(
+                {"field": "targets.concentration", "solute": solute, "value": text}
+            )
+            continue
+        targets.append(Target(solute=solute, concentration=concentration))
+
+    if final_volume is not None and final_volume == 0:
+        invalid_decimals.append(
+            {"field": "final_volume_ml", "value": final_volume_text}
+        )
+
+    known_solutes = {
+        solute for stock in stocks for solute in stock.concentrations
+    }
+    unknown_targets = sorted(
+        {target.solute for target in targets if target.solute not in known_solutes}
+    )
+
+    if duplicate_ids or duplicate_targets or unknown_targets or invalid_decimals:
+        details: dict[str, Any] = {}
+        if duplicate_ids:
+            details["duplicate_stock_ids"] = sorted(set(duplicate_ids))
+        if duplicate_targets:
+            details["duplicate_targets"] = sorted(set(duplicate_targets))
+        if unknown_targets:
+            details["unknown_solutes"] = unknown_targets
+        if invalid_decimals:
+            details["invalid_decimals"] = invalid_decimals
+        return STATUS_CODES["INVALID_BLEND"], {
+            "error": error_payload(
+                "INVALID_BLEND",
+                "溶液配制请求必须合法：母液标识与目标溶质均不得重复，"
+                "每个目标溶质都必须出现在至少一种母液的 concentrations 中，"
+                "浓度（mol/L）与体积（mL）必须是严格非负的十进制字符串"
+                "（不能为 JSON 数字），且终体积必须严格大于 0",
+                details,
+            ),
+        }
+
+    # ---- 精确有理数求解
+    result = solve_blend(stocks, targets, final_volume)
+    if result is None:
+        return STATUS_CODES["BLEND_NO_SOLUTION"], {
+            "error": error_payload(
+                "BLEND_NO_SOLUTION",
+                "在各母液可用体积与目标终体积约束内，不存在满足全部目标浓度"
+                "的非负母液取用量（浓度需由母液混合精确达到，无法用水稀释"
+                "补足溶质）",
+                {
+                    "stock_ids": [item["id"] for item in stock_items],
+                    "targets": [
+                        {"solute": item["solute"], "concentration": item["concentration"]}
+                        for item in target_items
+                    ],
+                    "final_volume_ml": final_volume_text,
+                },
+            ),
+        }
+
+    taken: list[Fraction] = result["taken"]
+    target_map = {target.solute: target.concentration for target in targets}
+    target_text = {item["solute"]: item["concentration"] for item in target_items}
+    return 200, {
+        "final_volume_ml": final_volume_text,
+        "stocks": [
+            {
+                "id": stock.id,
+                "available_volume_ml": item["available_volume_ml"],
+                "taken_volume_ml": fraction_to_decimal_string(amount),
+            }
+            for stock, item, amount in zip(stocks, stock_items, taken)
+        ],
+        "total_stock_volume_ml": fraction_to_decimal_string(result["total_stock"]),
+        "water_volume_ml": fraction_to_decimal_string(result["water"]),
+        "final_concentrations": [
+            {
+                "solute": solute,
+                "target_concentration": (
+                    target_text[solute] if solute in target_map else None
+                ),
+                "final_concentration": fraction_to_decimal_string(value),
+            }
+            for solute, value in result["final_concentrations"]
+        ],
+    }

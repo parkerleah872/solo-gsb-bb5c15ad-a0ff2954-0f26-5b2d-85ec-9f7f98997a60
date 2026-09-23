@@ -656,3 +656,153 @@ class AllocateResponse(BaseModel):
         "按规范化物种、失效日期、批号排序"
     )
     summary: AllocationSummary = Field(description="跨物种汇总与总体状态")
+
+
+# ------------------------------------------------------------ 溶液配制
+class StockSolution(BaseModel):
+    """一种待混合的母液：标识、各溶质浓度与可用体积。"""
+
+    id: str = Field(
+        ...,
+        min_length=1,
+        description="母液标识（非空字符串），单次请求内必须唯一；结果按输入顺序回显",
+        examples=["stock-A"],
+    )
+    concentrations: dict[str, str] = Field(
+        ...,
+        min_length=1,
+        description="该母液各溶质浓度（mol/L）的非负十进制字符串映射，"
+        "键为非空白溶质名（如 \"NaCl\"、\"H+\"），值如 \"0.5\"、\"0\"、\"1e-3\"，"
+        "不要传 JSON 数字；未列出的溶质视为 0",
+        examples=[{"NaCl": "0.5", "KCl": "0.2"}],
+    )
+    available_volume_ml: str = Field(
+        ...,
+        min_length=1,
+        description="该母液可用体积（mL）的非负十进制字符串，"
+        "如 \"100\"、\"12.5\"、\"0\"，不要传 JSON 数字",
+        examples=["100"],
+    )
+
+    @field_validator("id", "available_volume_ml")
+    @classmethod
+    def _strip_text(cls, value: str) -> str:
+        if not isinstance(value, str):
+            raise ValueError("必须是字符串")
+        stripped = value.strip()
+        if not stripped:
+            raise ValueError("不能为空白字符串")
+        return stripped
+
+    @field_validator("concentrations")
+    @classmethod
+    def _strip_concentrations(cls, value: dict[str, str]) -> dict[str, str]:
+        cleaned: dict[str, str] = {}
+        for name, amount in value.items():
+            if not isinstance(name, str) or not isinstance(amount, str):
+                raise ValueError("溶质名与浓度都必须是字符串")
+            stripped_name = name.strip()
+            stripped_amount = amount.strip()
+            if not stripped_name or not stripped_amount:
+                raise ValueError("溶质名与浓度不能为空白字符串")
+            cleaned[stripped_name] = stripped_amount
+        return cleaned
+
+
+class BlendTarget(BaseModel):
+    """一条目标溶质终浓度记录。"""
+
+    solute: str = Field(
+        ...,
+        min_length=1,
+        description="目标溶质名（非空白字符串），须为至少一种母液所含溶质；"
+        "同一目标溶质不得重复",
+        examples=["NaCl"],
+    )
+    concentration: str = Field(
+        ...,
+        min_length=1,
+        description="该溶质在终溶液中的目标浓度（mol/L）非负十进制字符串，"
+        "如 \"0.1\"、\"0\"、\"1e-3\"，不要传 JSON 数字",
+        examples=["0.1"],
+    )
+
+    @field_validator("solute", "concentration")
+    @classmethod
+    def _strip_text(cls, value: str) -> str:
+        if not isinstance(value, str):
+            raise ValueError("必须是字符串")
+        stripped = value.strip()
+        if not stripped:
+            raise ValueError("不能为空白字符串")
+        return stripped
+
+
+class BlendRequest(BaseModel):
+    """``POST /solutions/blend`` 请求：母液清单、目标终体积与目标浓度。"""
+
+    stocks: list[StockSolution] = Field(
+        ...,
+        min_length=1,
+        max_length=4,
+        description="母液清单，1～4 种；按输入顺序参与字典序择优与结果回显",
+    )
+    final_volume_ml: str = Field(
+        ...,
+        min_length=1,
+        description="目标终体积（mL）的非负十进制字符串，且必须严格大于 0；"
+        "不要传 JSON 数字",
+        examples=["250"],
+    )
+    targets: list[BlendTarget] = Field(
+        ...,
+        min_length=1,
+        description="各溶质目标终浓度记录，至少一条；同一溶质不得重复，"
+        "且每种目标溶质都必须出现在至少一种母液的 concentrations 中"
+        "（目标浓度为 0 时亦须如此）",
+    )
+
+    @field_validator("final_volume_ml")
+    @classmethod
+    def _strip_volume(cls, value: str) -> str:
+        if not isinstance(value, str):
+            raise ValueError("必须是字符串")
+        stripped = value.strip()
+        if not stripped:
+            raise ValueError("不能为空白字符串")
+        return stripped
+
+
+class StockTake(BaseModel):
+    id: str = Field(description="母液标识（回显）")
+    available_volume_ml: str = Field(description="可用体积（mL，回显）")
+    taken_volume_ml: str = Field(
+        description="该母液的取用量（mL），不超过可用体积；未取用为 \"0\""
+    )
+
+
+class FinalConcentration(BaseModel):
+    solute: str = Field(description="溶质名（回显）")
+    target_concentration: str | None = Field(
+        description="客户端请求的目标浓度（mol/L，回显）；仅出现在母液中、"
+        "未列入 targets 的溶质为 null"
+    )
+    final_concentration: str = Field(
+        description="按取用量精确计算的终浓度（mol/L），应逐位等于目标浓度"
+    )
+
+
+class BlendResponse(BaseModel):
+    final_volume_ml: str = Field(description="目标终体积（mL，回显）")
+    stocks: list[StockTake] = Field(
+        description="按输入顺序的各母液取用量；多解时已按母液总取用量最小、"
+        "再按输入顺序取用量字典序最小择优"
+    )
+    total_stock_volume_ml: str = Field(description="全部母液取用量合计（mL）")
+    water_volume_ml: str = Field(
+        description="补水量 = 终体积 − 母液总取用量（mL，非负）"
+    )
+    final_concentrations: list[FinalConcentration] = Field(
+        description="全部出现过的溶质的终浓度：目标溶质按 targets 首次出现顺序在前，"
+        "仅母液含有的溶质按名字升序在后"
+    )
