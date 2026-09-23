@@ -18,6 +18,10 @@
 * ``POST /inventory/allocate`` 试剂批次 FEFO 领用分配：按失效日期优先、
   同日批号升序跨批次扣减（名义量×纯度换算有效物质），跳过过期/隔离批次，
   返回每批领用/余量、未满足需求与汇总状态；
+* ``POST /solutions/blend``   溶液配制：不超过 4 种母液（各溶质浓度 +
+  可用体积）+ 目标终体积与各溶质目标浓度，以精确有理数求满足全部目标
+  浓度的非负母液取用量（母液总量最小、再按输入顺序字典序最小），
+  余量用水补足，返回各母液取用量、补水量与最终浓度；
 * ``GET  /reactions/{reaction_id}``  按幂等 ID 取回结果；
 * ``GET  /health``   健康检查。
 """
@@ -34,6 +38,8 @@ from .models import (
     AllocateResponse,
     AnalyzeResponse,
     BalanceResponse,
+    BlendRequest,
+    BlendResponse,
     ReactionRequest,
     ReversePlanRequest,
     ReversePlanResponse,
@@ -52,6 +58,7 @@ from .service import (
     process_allocate,
     process_analyze,
     process_balance,
+    process_blend,
     process_reverse_plan,
     process_sequence,
     process_stoichiometry,
@@ -244,6 +251,25 @@ async def inventory_allocate(request: AllocateRequest):
             for item in request.batches
         ],
         request.accounting_date,
+    )
+    return JSONResponse(status_code=status, content=payload)
+
+
+@app.post(
+    "/api/v1/solutions/blend",
+    response_model=BlendResponse,
+    tags=["溶液"],
+    summary="溶液配制：满足全部目标浓度的最小母液取用量、补水量与最终浓度",
+    responses={
+        422: {"description": "输入非法（标识/溶质重复、浓度或体积非法、终体积非正）"
+              " / 无可行解"},
+    },
+)
+async def solutions_blend(request: BlendRequest):
+    status, payload = process_blend(
+        [item.model_dump() for item in request.stocks],
+        request.target_volume,
+        [item.model_dump() for item in request.targets],
     )
     return JSONResponse(status_code=status, content=payload)
 

@@ -25,6 +25,7 @@ from .balancer import (
     parse_side,
     solve_reaction,
 )
+from .blending import Stock, solve_blend
 from .cache import ReactionRecord, build_signature, cache, reaction_id_for, species_key
 from .parser import FormulaError, parse_formula
 from .stoichiometry import (
@@ -50,6 +51,8 @@ STATUS_CODES = {
     "CHARGE_NOT_CONSERVED": 422,
     VARIANT_SPACE_TOO_LARGE: 422,
     "INVALID_INVENTORY": 422,
+    "INVALID_BLEND": 422,
+    "NO_FEASIBLE_BLEND": 422,
 }
 
 
@@ -1097,3 +1100,217 @@ def process_allocate(
 
     result = allocate(demands, batches, accounting_date)
     return 200, render_allocation(result)
+
+
+# ------------------------------------------------------------ 溶液配制（母液混合）
+def process_blend(
+    stock_items: list[dict[str, Any]],
+    target_volume_text: str,
+    target_items: list[dict[str, str]],
+) -> tuple[int, dict[str, Any]]:
+    """溶液配制（母液混合），返回 (http_status, payload)。
+
+    逐条解析母液（标识、各溶质浓度、可用体积）与目标（终体积、各溶质目标
+    浓度），聚合全部可定位的输入问题为 422 INVALID_BLEND（标识/溶质重复、
+    浓度或体积非法、终体积非正）；随后调用
+    :func:`app.blending.solve_blend` 以精确有理数求满足全部目标浓度、
+    可用体积与总量预算的母液取用量（先母液总量最小、再按输入顺序字典序
+    最小），余量用水补足；无解时返回 422 NO_FEASIBLE_BLEND 并附逐溶质
+    供应诊断。该接口为无状态计算，不读写幂等缓存。
+    """
+    # ---- 母液：标识唯一性、溶质浓度与可用体积
+    stocks: list[Stock] = []
+    invalid_concentrations: list[dict[str, str]] = []
+    invalid_volumes: list[dict[str, str]] = []
+    duplicate_stock_ids: list[str] = []
+    duplicate_stock_solutes: list[dict[str, str]] = []
+    seen_ids: set[str] = set()
+
+    for item in stock_items:
+        stock_id = item["id"]
+        if stock_id in seen_ids:
+            duplicate_stock_ids.append(stock_id)
+        seen_ids.add(stock_id)
+
+        concentrations: dict[str, Fraction] = {}
+        seen_solutes: set[str] = set()
+        solutes_valid = True
+        for entry in item["solutes"]:
+            solute = entry["solute"]
+            text = entry["concentration"]
+            if solute in seen_solutes:
+                duplicate_stock_solutes.append(
+                    {"stock_id": stock_id, "solute": solute}
+                )
+            seen_solutes.add(solute)
+            try:
+                value = parse_moles(text)
+            except (ValueError, InvalidOperation):
+                invalid_concentrations.append(
+                    {"stock_id": stock_id, "solute": solute, "concentration": text}
+                )
+                solutes_valid = False
+            else:
+                concentrations.setdefault(solute, decimal_to_fraction(value))
+
+        try:
+            available = parse_moles(item["available_volume"])
+        except (ValueError, InvalidOperation):
+            invalid_volumes.append(
+                {"stock_id": stock_id, "available_volume": item["available_volume"]}
+            )
+            available = None
+
+        if solutes_valid and available is not None:
+            stocks.append(
+                Stock(
+                    id=stock_id,
+                    concentrations=concentrations,
+                    available_volume=decimal_to_fraction(available),
+                )
+            )
+
+    # ---- 目标：终体积与各溶质目标浓度
+    targets: dict[str, Fraction] = {}
+    invalid_target_concentrations: list[dict[str, str]] = []
+    duplicate_target_solutes: list[str] = []
+    seen_target_solutes: set[str] = set()
+
+    for entry in target_items:
+        solute = entry["solute"]
+        text = entry["concentration"]
+        if solute in seen_target_solutes:
+            duplicate_target_solutes.append(solute)
+        seen_target_solutes.add(solute)
+        try:
+            value = parse_moles(text)
+        except (ValueError, InvalidOperation):
+            invalid_target_concentrations.append(
+                {"solute": solute, "concentration": text}
+            )
+        else:
+            targets.setdefault(solute, decimal_to_fraction(value))
+
+    try:
+        final_volume = parse_moles(target_volume_text)
+    except (ValueError, InvalidOperation):
+        final_volume = None
+    # 终体积为 0 时最终浓度无定义，要求严格为正
+    invalid_target_volume = final_volume is None or final_volume == 0
+
+    # ---- 聚合所有输入问题
+    if (
+        duplicate_stock_ids
+        or duplicate_stock_solutes
+        or invalid_concentrations
+        or invalid_volumes
+        or duplicate_target_solutes
+        or invalid_target_concentrations
+        or invalid_target_volume
+    ):
+        details: dict[str, Any] = {}
+        if duplicate_stock_ids:
+            details["duplicate_stock_ids"] = sorted(set(duplicate_stock_ids))
+        if duplicate_stock_solutes:
+            details["duplicate_stock_solutes"] = duplicate_stock_solutes
+        if invalid_concentrations:
+            details["invalid_concentrations"] = invalid_concentrations
+        if invalid_volumes:
+            details["invalid_available_volumes"] = invalid_volumes
+        if duplicate_target_solutes:
+            details["duplicate_target_solutes"] = sorted(set(duplicate_target_solutes))
+        if invalid_target_concentrations:
+            details["invalid_target_concentrations"] = invalid_target_concentrations
+        if invalid_target_volume:
+            details["invalid_target_volume"] = target_volume_text
+        return STATUS_CODES["INVALID_BLEND"], {
+            "error": error_payload(
+                "INVALID_BLEND",
+                "母液与目标必须合法：母液标识不得重复，同一母液内溶质不得重复，"
+                "目标溶质不得重复；浓度与体积必须是非负十进制字符串"
+                "（不能为 JSON 数字），目标终体积必须为正数",
+                details,
+            ),
+        }
+
+    volume = decimal_to_fraction(final_volume)
+    solution = solve_blend(stocks, targets, volume)
+    if solution is None:
+        # 逐溶质供应诊断：目标需求量（mmol）是否超出全部母液可用量合计
+        insufficient = []
+        for solute in sorted(targets):
+            required = targets[solute] * volume
+            supply = sum(
+                (
+                    stock.concentrations.get(solute, Fraction(0))
+                    * stock.available_volume
+                    for stock in stocks
+                ),
+                Fraction(0),
+            )
+            if required > supply:
+                insufficient.append(
+                    {
+                        "solute": solute,
+                        "required_mmol": fraction_to_decimal_string(required),
+                        "available_mmol": fraction_to_decimal_string(supply),
+                    }
+                )
+        details = {"target_volume": fraction_to_decimal_string(volume)}
+        if insufficient:
+            details["insufficient_solutes"] = insufficient
+        return STATUS_CODES["NO_FEASIBLE_BLEND"], {
+            "error": error_payload(
+                "NO_FEASIBLE_BLEND",
+                "无解：在可用体积与终体积约束下，不存在同时满足全部目标浓度的"
+                "非负母液取用量（余量用水补足）；请降低目标浓度、增大终体积"
+                "或补充母液",
+                details,
+            ),
+        }
+
+    # ---- 渲染：各母液取用量（输入顺序）、补水量与全部涉及溶质的最终浓度
+    all_solutes = sorted(
+        set(targets) | {s for stock in stocks for s in stock.concentrations}
+    )
+    final_concentrations: list[dict[str, Any]] = []
+    for solute in all_solutes:
+        final_value = sum(
+            (
+                stock.concentrations.get(solute, Fraction(0)) * used
+                for stock, used in zip(stocks, solution.volumes)
+            ),
+            Fraction(0),
+        ) / volume
+        final_concentrations.append(
+            {
+                "solute": solute,
+                "target_concentration": (
+                    fraction_to_decimal_string(targets[solute])
+                    if solute in targets
+                    else None
+                ),
+                "final_concentration": fraction_to_decimal_string(final_value),
+                "target_met": True if solute in targets else None,
+            }
+        )
+
+    return 200, {
+        "target_volume": fraction_to_decimal_string(volume),
+        "total_stock_volume": fraction_to_decimal_string(sum(solution.volumes)),
+        "water_added": fraction_to_decimal_string(solution.water),
+        "stocks": [
+            {
+                "id": stock.id,
+                "available_volume": fraction_to_decimal_string(
+                    stock.available_volume
+                ),
+                "volume_used": fraction_to_decimal_string(used),
+                "remaining_volume": fraction_to_decimal_string(
+                    stock.available_volume - used
+                ),
+            }
+            for stock, used in zip(stocks, solution.volumes)
+        ],
+        "final_concentrations": final_concentrations,
+    }

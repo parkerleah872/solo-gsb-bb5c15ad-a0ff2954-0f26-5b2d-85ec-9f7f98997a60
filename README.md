@@ -26,7 +26,12 @@
    摩尔需求与带批号/纯度/名义摩尔数/失效日期/状态的库存批次及核算日期，
    服务按失效日期优先、同日批号升序跨批次扣减（名义量 × 纯度换算有效物质），
    跳过已过期与隔离批次，返回每批领用/余量、未满足需求与汇总状态；
-10. 对同一规范化反应做幂等缓存，重复请求返回相同的 `reaction_id` 与结果。
+10. `/solutions/blend` 做**溶液配制**：提交不超过 4 种母液（各溶质浓度 +
+    可用体积）、目标终体积与各溶质目标浓度（均为非负十进制字符串，浓度
+    mol/L、体积 mL），以精确有理数求满足全部目标浓度的非负母液取用量
+    （受可用体积与终体积约束，余量用水补足；多解时先取母液总量最小、再按
+    输入顺序取用量字典序最小），返回各母液取用量、补水量与最终浓度；
+11. 对同一规范化反应做幂等缓存，重复请求返回相同的 `reaction_id` 与结果。
 
 ---
 
@@ -102,6 +107,22 @@ curl -X POST http://localhost:8000/api/v1/inventory/allocate \
   }'
 ```
 
+溶液配制——用 1.0 mol/L 的 NaCl 母液配 250 mL 0.1 mol/L 目标液（取 25 mL
+母液、补水 225 mL）：
+
+```bash
+curl -X POST http://localhost:8000/api/v1/solutions/blend \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "stocks": [
+      {"id": "stock-A", "available_volume": "100",
+       "solutes": [{"solute": "NaCl", "concentration": "1.0"}]}
+    ],
+    "target_volume": "250",
+    "targets": [{"solute": "NaCl", "concentration": "0.1"}]
+  }'
+```
+
 ### 不用 Docker 的本地运行方式
 
 ```bash
@@ -114,7 +135,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 
 ```bash
 pip install -r requirements-dev.txt
-pytest          # 267 个测试
+pytest          # 315 个测试
 ```
 
 ---
@@ -131,6 +152,7 @@ pytest          # 267 个测试
 | POST | `/api/v1/stoichiometry/yield` | 实际收率：投料摩尔数与各生成物实际产量 → 逐种理论产量、实际产量与收率百分比 |
 | POST | `/api/v1/stoichiometry/sequence` | 连续反应推演：多步反应按顺序消耗/产出，逐步传递库存，返回各步明细与最终库存 |
 | POST | `/api/v1/inventory/allocate` | 试剂批次 FEFO 领用分配：按失效日期优先、同日批号升序跨批次扣减，跳过过期/隔离批次，返回每批领用/余量、未满足需求与汇总状态 |
+| POST | `/api/v1/solutions/blend` | 溶液配制：不超过 4 种母液 + 目标终体积与各溶质目标浓度 → 满足全部目标浓度的最小母液取用量、补水量与最终浓度 |
 | GET | `/api/v1/reactions/{reaction_id}` | 按幂等 ID 取回之前的结果 |
 | GET | `/health` | 健康检查 |
 
@@ -764,7 +786,98 @@ curl -X POST http://localhost:8000/api/v1/stoichiometry/sequence \
 该接口为无状态计算（不读写幂等缓存、不持久化扣减结果）；同一请求重复调用
 得到完全一致的分配。
 
-### 2.9 幂等与查询
+### 2.9 溶液配制 `POST /api/v1/solutions/blend`
+
+提交 **1～4 种母液**（标识、各溶质浓度、可用体积）、**目标终体积**与
+**各溶质目标浓度**，服务端以精确有理数（全程不经过 `float`）求一组
+**非负母液取用量**，使得：
+
+* 每个目标溶质 j 满足摩尔守恒 Σ(母液浓度 × 取用量) = 目标浓度 × 终体积
+  （浓度 mol/L × 体积 mL，两侧同为毫摩尔量级）；
+* 每种母液取用量不超过其可用体积（`0 ≤ x_i ≤ available_volume`）；
+* 母液总取用量不超过终体积，**余量用水补足**（`water_added = 终体积 − 总量 ≥ 0`）；
+* 多解时先取**母液总量最小**，再按**输入顺序取用量字典序最小**
+  （如两种母液完全等价时，排在前面的取用量为 0）。
+
+请求体（所有数值均为**非负十进制字符串**，不要传 JSON 数字；`target_volume`
+必须为正）：
+
+```bash
+curl -X POST http://localhost:8000/api/v1/solutions/blend \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "stocks": [
+      {"id": "conc-NaCl", "available_volume": "100",
+       "solutes": [{"solute": "NaCl", "concentration": "1.0"},
+                   {"solute": "KCl",  "concentration": "0.5"}]},
+      {"id": "conc-KCl", "available_volume": "100",
+       "solutes": [{"solute": "NaCl", "concentration": "0.2"},
+                   {"solute": "KCl",  "concentration": "1.0"}]}
+    ],
+    "target_volume": "100",
+    "targets": [
+      {"solute": "NaCl", "concentration": "0.4"},
+      {"solute": "KCl",  "concentration": "0.6"}
+    ]
+  }'
+```
+
+字段约束：
+
+| 字段 | 约束 |
+| --- | --- |
+| `stocks` | 1～4 条；`id` 为非空字符串且请求内唯一 |
+| `stocks[].solutes` | 该母液的溶质浓度列表（空列表表示纯溶剂）；同一溶质不得重复；`concentration` 为**非负十进制字符串**（mol/L） |
+| `stocks[].available_volume` | 可用体积，**非负十进制字符串**（mL） |
+| `target_volume` | 目标终体积，**正十进制字符串**（mL，必须 > 0） |
+| `targets` | 至少 1 条；同一溶质不得重复；`concentration` 为**非负十进制字符串**（mol/L）；母液带入但未列入目标的溶质不约束，仅在 `final_concentrations` 中报告 |
+
+`200` 响应（上例的解为 `conc-NaCl` 取 280/9 mL、`conc-KCl` 取 400/9 mL，
+无限小数按 **28 位有效数字**银行家舍入输出，规则同其它计量接口）：
+
+```json
+{
+  "target_volume": "100",
+  "total_stock_volume": "75.55555555555555555555555556",
+  "water_added": "24.44444444444444444444444444",
+  "stocks": [
+    {"id": "conc-NaCl", "available_volume": "100",
+     "volume_used": "31.11111111111111111111111111",
+     "remaining_volume": "68.88888888888888888888888889"},
+    {"id": "conc-KCl", "available_volume": "100",
+     "volume_used": "44.44444444444444444444444444",
+     "remaining_volume": "55.55555555555555555555555556"}
+  ],
+  "final_concentrations": [
+    {"solute": "KCl", "target_concentration": "0.6",
+     "final_concentration": "0.6", "target_met": true},
+    {"solute": "NaCl", "target_concentration": "0.4",
+     "final_concentration": "0.4", "target_met": true}
+  ]
+}
+```
+
+字段说明：
+
+| 字段 | 含义 |
+| --- | --- |
+| `total_stock_volume` | 母液总取用量（mL），已在全部可行解中最小化 |
+| `water_added` | 补水量 = 终体积 − 母液总取用量（mL，非负） |
+| `stocks[]` | 各母液取用量与取用后余量，**与请求 stocks 顺序一致** |
+| `final_concentrations[]` | 全部涉及溶质（目标 ∪ 母液带入）的最终浓度，按溶质标识排序；非目标溶质的 `target_concentration` / `target_met` 为 `null` |
+
+错误响应：
+
+| 场景 | HTTP / code |
+| --- | --- |
+| 无可行解：目标超出供应、可用体积或终体积预算不足、零目标与必需母液冲突等（`details.insufficient_solutes` 逐溶质给出需求/可供 mmol，仅单溶质供应不足时出现） | `422 NO_FEASIBLE_BLEND` |
+| 母液标识重复（`details.duplicate_stock_ids`）、母液内溶质重复（`details.duplicate_stock_solutes`）、目标溶质重复（`details.duplicate_target_solutes`） | `422 INVALID_BLEND` |
+| 浓度/体积非法：负数、NaN、非数字字符串（`details.invalid_concentrations` / `invalid_available_volumes` / `invalid_target_concentrations`）；终体积非正（`details.invalid_target_volume`） | `422 INVALID_BLEND` |
+| 母液超过 4 种、列表为空、缺字段、数值传成 JSON 数字、空白字符串 | `422 INVALID_REQUEST` |
+
+该接口为无状态计算（不读写幂等缓存）；同一请求重复调用得到完全一致的结果。
+
+### 2.10 幂等与查询
 
 * 幂等键与书写顺序、括号风格、空白以及电荷的等价写法无关，只取决于每一侧
   物种的 **（元素组成多重集, 电荷）**。
@@ -843,6 +956,8 @@ LCM），热循环只剩整数乘加；自由变量最多 3 个、系数上限 3
 | `INVALID_STOICHIOMETRY` | 422 | 唯一解符号不一致，物种可能需要换边 |
 | `VARIANT_SPACE_TOO_LARGE` | 422 | `/balance/variants` 零空间维数（自由变量数）> 3，枚举空间过大（返回 `nullity`） |
 | `INVALID_INVENTORY` | 422 | `/inventory/allocate` 需求物种或批号重复、纯度不在 (0,1]、有效/名义摩尔数非法（含 JSON 数字）或批次状态未知，问题明细在 `details` 中聚合返回 |
+| `INVALID_BLEND` | 422 | `/solutions/blend` 母液标识或溶质重复、目标溶质重复、浓度/体积非法（含 JSON 数字）或目标终体积非正，问题明细在 `details` 中聚合返回 |
+| `NO_FEASIBLE_BLEND` | 422 | `/solutions/blend` 无可行解：在可用体积与终体积约束下不存在满足全部目标浓度的非负取用量（`details.insufficient_solutes` 给出单溶质供应诊断） |
 | `NOT_FOUND` | 404 | `reaction_id` 不在缓存中 |
 
 不唯一示例：`C + O2 -> CO + CO2` 缺少约束，返回
@@ -868,10 +983,11 @@ app/
   cache.py          规范化签名（SHA-256）与 LRU 幂等缓存
   stoichiometry.py  投料量 -> 反应进度（正向批量计量）、目标产量 -> 最小反应进度/理论投料（反向规划）、投料+实际产量 -> 理论/实际/收率百分比（收率计算）与多步连续反应库存推演，Decimal/Fraction 精确计算
   allocation.py     试剂批次 FEFO 领用分配：纯度换算有效物质、跨批拆分、过期/隔离跳过、未满足需求与汇总，Fraction 精确计算
+  blending.py       溶液配制：目标溶质摩尔守恒 + 可用体积/终体积约束的精确线性规划（顶点枚举），母液总量最小、再按输入顺序字典序最小，Fraction 精确计算
   service.py        业务编排与响应组装
   models.py         Pydantic 请求/响应模型
   main.py           FastAPI 路由与异常处理
-tests/              解析器、配平核心、HTTP API、批量计量、反向投料规划、实际收率、连续反应推演、试剂批次领用分配共 267 个测试
+tests/              解析器、配平核心、HTTP API、批量计量、反向投料规划、实际收率、连续反应推演、试剂批次领用分配、溶液配制共 315 个测试
 Dockerfile
 docker-compose.yml
 requirements.txt / requirements-dev.txt

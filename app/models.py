@@ -656,3 +656,154 @@ class AllocateResponse(BaseModel):
         "按规范化物种、失效日期、批号排序"
     )
     summary: AllocationSummary = Field(description="跨物种汇总与总体状态")
+
+
+# ------------------------------------------------------------ 溶液配制（母液混合）
+class BlendSolute(BaseModel):
+    """母液中的一条溶质浓度记录。"""
+
+    solute: str = Field(
+        ...,
+        min_length=1,
+        description="溶质标识（任意非空字符串，如 \"NaCl\"）；同一母液内不得重复",
+        examples=["NaCl"],
+    )
+    concentration: str = Field(
+        ...,
+        min_length=1,
+        description="该溶质在母液中的浓度，非负十进制字符串，单位 mol/L"
+        "（如 \"2.0\"、\"0\"、\"1e-3\"），不要传 JSON 数字以避免浮点误差",
+        examples=["2.0"],
+    )
+
+    @field_validator("solute", "concentration")
+    @classmethod
+    def _strip_text(cls, value: str) -> str:
+        if not isinstance(value, str):
+            raise ValueError("必须是字符串")
+        stripped = value.strip()
+        if not stripped:
+            raise ValueError("不能为空白字符串")
+        return stripped
+
+
+class BlendStock(BaseModel):
+    """一条母液：标识、各溶质浓度与可用体积。"""
+
+    id: str = Field(
+        ...,
+        min_length=1,
+        description="母液标识；单次请求内必须唯一",
+        examples=["stock-A"],
+    )
+    solutes: list[BlendSolute] = Field(
+        ...,
+        description="母液中各溶质的浓度记录；同一溶质不得重复；空列表表示纯溶剂",
+    )
+    available_volume: str = Field(
+        ...,
+        min_length=1,
+        description="该母液的可用体积，非负十进制字符串，单位 mL"
+        "（如 \"100\"、\"0\"），不要传 JSON 数字",
+        examples=["100"],
+    )
+
+    @field_validator("id", "available_volume")
+    @classmethod
+    def _strip_text(cls, value: str) -> str:
+        if not isinstance(value, str):
+            raise ValueError("必须是字符串")
+        stripped = value.strip()
+        if not stripped:
+            raise ValueError("不能为空白字符串")
+        return stripped
+
+
+class BlendTarget(BaseModel):
+    """一条目标溶质浓度记录。"""
+
+    solute: str = Field(
+        ...,
+        min_length=1,
+        description="目标溶质标识；在 targets 内不得重复",
+        examples=["NaCl"],
+    )
+    concentration: str = Field(
+        ...,
+        min_length=1,
+        description="该溶质的目标终浓度，非负十进制字符串，单位 mol/L"
+        "（如 \"0.1\"、\"0\"），不要传 JSON 数字",
+        examples=["0.1"],
+    )
+
+    @field_validator("solute", "concentration")
+    @classmethod
+    def _strip_text(cls, value: str) -> str:
+        if not isinstance(value, str):
+            raise ValueError("必须是字符串")
+        stripped = value.strip()
+        if not stripped:
+            raise ValueError("不能为空白字符串")
+        return stripped
+
+
+class BlendRequest(BaseModel):
+    """``POST /solutions/blend`` 请求：母液清单、目标终体积与各溶质目标浓度。"""
+
+    stocks: list[BlendStock] = Field(
+        ...,
+        min_length=1,
+        max_length=4,
+        description="参与配制的母液，1～4 种；标识不得重复",
+    )
+    target_volume: str = Field(
+        ...,
+        min_length=1,
+        description="目标终体积，**正**十进制字符串，单位 mL（如 \"250\"），"
+        "不要传 JSON 数字",
+        examples=["250"],
+    )
+    targets: list[BlendTarget] = Field(
+        ...,
+        min_length=1,
+        description="各溶质目标终浓度，至少一条；同一溶质不得重复；"
+        "母液带入但未列入目标的溶质不约束，仅在最终浓度中报告",
+    )
+
+
+class BlendStockResult(BaseModel):
+    """一条母液的取用结果。"""
+
+    id: str = Field(description="母液标识（回显，与请求顺序一致）")
+    available_volume: str = Field(description="可用体积（mL，回显）")
+    volume_used: str = Field(description="本次取用量（mL）")
+    remaining_volume: str = Field(description="取用后剩余体积 = 可用体积 − 取用量（mL）")
+
+
+class BlendSoluteResult(BaseModel):
+    """一个溶质的最终浓度核对结果。"""
+
+    solute: str = Field(description="溶质标识")
+    target_concentration: str | None = Field(
+        description="目标终浓度（mol/L，回显）；未列入目标的溶质为 null"
+    )
+    final_concentration: str = Field(
+        description="配制后的最终浓度 = Σ(母液浓度 × 取用量) ÷ 终体积（mol/L）"
+    )
+    target_met: bool | None = Field(
+        description="是否达到目标浓度；目标溶质恒为 true，非目标溶质为 null"
+    )
+
+
+class BlendResponse(BaseModel):
+    target_volume: str = Field(description="目标终体积（mL，回显）")
+    total_stock_volume: str = Field(description="母液总取用量（mL，已最小化）")
+    water_added: str = Field(
+        description="补水量 = 终体积 − 母液总取用量（mL，非负）"
+    )
+    stocks: list[BlendStockResult] = Field(
+        description="各母液取用量，与请求 stocks 顺序一致"
+    )
+    final_concentrations: list[BlendSoluteResult] = Field(
+        description="全部涉及溶质（目标 ∪ 母液带入）的最终浓度，按溶质标识排序"
+    )
